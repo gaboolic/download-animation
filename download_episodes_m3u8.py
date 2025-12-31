@@ -318,6 +318,7 @@ class CCTVDownloader:
             if result.returncode != 0:
                 return False
         except (FileNotFoundError, subprocess.TimeoutExpired):
+            print("  ffmpeg未安装或无法使用")
             return False
         
         try:
@@ -475,10 +476,10 @@ class CCTVDownloader:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         # 方法1: 尝试使用ffmpeg直接下载（最快）
-        print("  尝试使用ffmpeg下载...")
-        if self.download_with_ffmpeg(m3u8_url, output_path):
-            print(f"  ✓ ffmpeg下载成功")
-            return True
+        # print("  尝试使用ffmpeg下载...")
+        # if self.download_with_ffmpeg(m3u8_url, output_path):
+        #     print(f"  ✓ ffmpeg下载成功")
+        #     return True
         
         # 方法2: 多线程下载ts片段并合并
         print("  使用多线程下载方式...")
