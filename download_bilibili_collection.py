@@ -56,6 +56,124 @@ class BilibiliCollectionDownloader:
             return match.group(1)
         return None
     
+    def extract_bvid_from_url(self, url):
+        """从URL中提取BV号"""
+        # URL格式: https://www.bilibili.com/video/BV1zEaLzMEck
+        match = re.search(r'/video/(BV[a-zA-Z0-9]+)', url)
+        if match:
+            return match.group(1)
+        # 也支持av号
+        match = re.search(r'/video/av(\d+)', url)
+        if match:
+            return f"av{match.group(1)}"
+        return None
+    
+    def get_collection_info_from_video_page(self, video_url):
+        """从视频页面获取合集信息"""
+        try:
+            print(f"正在获取视频页面信息: {video_url}")
+            response = self.session.get(video_url, timeout=30)
+            response.raise_for_status()
+            html_content = response.text
+            
+            # 方法1: 从window.__INITIAL_STATE__中提取
+            patterns = [
+                r'window\.__INITIAL_STATE__\s*=\s*({.+?});',
+                r'window\.__playinfo__\s*=\s*({.+?});',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, html_content, re.DOTALL)
+                if match:
+                    try:
+                        data_str = match.group(1)
+                        data = json.loads(data_str)
+                        
+                        # 查找合集信息
+                        collection_info = self._extract_collection_from_json(data)
+                        if collection_info:
+                            return collection_info
+                    except:
+                        continue
+            
+            # 方法2: 从HTML中直接搜索合集链接
+            # 合集链接格式: /space.bilibili.com/数字/lists/数字
+            collection_pattern = r'/space\.bilibili\.com/(\d+)/lists/(\d+)'
+            match = re.search(collection_pattern, html_content)
+            if match:
+                mid = match.group(1)
+                season_id = match.group(2)
+                return {
+                    'mid': mid,
+                    'season_id': season_id,
+                    'collection_url': f"https://space.bilibili.com/{mid}/lists/{season_id}?type=season"
+                }
+            
+            # 方法3: 从视频API获取合集信息
+            bvid = self.extract_bvid_from_url(video_url)
+            if bvid and bvid.startswith('BV'):
+                # 调用视频信息API
+                api_url = "https://api.bilibili.com/x/web-interface/view"
+                params = {'bvid': bvid}
+                response = self.session.get(api_url, params=params, timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('code') == 0 and 'data' in data:
+                        video_data = data['data']
+                        # 查找合集信息
+                        if 'ugc_season' in video_data:
+                            ugc_season = video_data['ugc_season']
+                            if 'id' in ugc_season and 'mid' in video_data.get('owner', {}):
+                                return {
+                                    'mid': str(video_data['owner']['mid']),
+                                    'season_id': str(ugc_season['id']),
+                                    'collection_url': f"https://space.bilibili.com/{video_data['owner']['mid']}/lists/{ugc_season['id']}?type=season"
+                                }
+            
+            return None
+        except Exception as e:
+            print(f"获取视频页面信息失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _extract_collection_from_json(self, data, path=""):
+        """递归从JSON数据中提取合集信息"""
+        if isinstance(data, dict):
+            # 检查是否包含合集信息
+            if 'ugc_season' in data:
+                ugc_season = data['ugc_season']
+                if isinstance(ugc_season, dict) and 'id' in ugc_season:
+                    mid = None
+                    # 尝试从不同路径获取mid
+                    if 'owner' in data:
+                        mid = data['owner'].get('mid')
+                    elif 'mid' in data:
+                        mid = data['mid']
+                    
+                    if mid:
+                        return {
+                            'mid': str(mid),
+                            'season_id': str(ugc_season['id']),
+                            'collection_url': f"https://space.bilibili.com/{mid}/lists/{ugc_season['id']}?type=season"
+                        }
+            
+            # 递归搜索
+            for key, value in data.items():
+                if isinstance(value, (dict, list)):
+                    result = self._extract_collection_from_json(value, f"{path}.{key}")
+                    if result:
+                        return result
+        
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                if isinstance(item, (dict, list)):
+                    result = self._extract_collection_from_json(item, f"{path}[{i}]")
+                    if result:
+                        return result
+        
+        return None
+    
     def extract_video_urls_from_html(self, html_content):
         """从HTML中提取视频URL"""
         video_urls = []
@@ -323,30 +441,57 @@ class BilibiliCollectionDownloader:
     
     def download_collection(self, collection_url, output_dir="downloads"):
         """主函数：下载合集"""
-        print(f"开始处理合集URL: {collection_url}")
+        print(f"开始处理URL: {collection_url}")
         print("=" * 60)
         
-        # 1. 下载页面
-        print("\n[1/4] 下载合集页面...")
-        page_path, html_content = self.download_page(collection_url)
-        if not html_content:
-            print("无法下载页面")
-            return
-        
-        # 2. 提取合集ID
-        print("\n[2/4] 提取合集信息...")
+        # 0. 判断是单个视频URL还是合集URL
+        original_url = collection_url
+        bvid = self.extract_bvid_from_url(collection_url)
         collection_id = self.extract_collection_id(collection_url)
-        if collection_id:
-            print(f"合集ID: {collection_id}")
+        mid = None
+        html_content = None
         
-        # 从URL中提取mid（用户ID）
-        mid_match = re.search(r'/space\.bilibili\.com/(\d+)', collection_url)
-        mid = mid_match.group(1) if mid_match else None
-        if mid:
-            print(f"用户ID: {mid}")
+        if bvid and not collection_id:
+            # 这是单个视频URL，需要先获取合集信息
+            print("\n[0/5] 检测到单个视频URL，正在获取合集信息...")
+            collection_info = self.get_collection_info_from_video_page(collection_url)
+            if collection_info:
+                mid = collection_info.get('mid')
+                collection_id = collection_info.get('season_id')
+                collection_url = collection_info.get('collection_url', collection_url)
+                print(f"  找到合集信息:")
+                print(f"  用户ID: {mid}")
+                print(f"  合集ID: {collection_id}")
+                print(f"  合集URL: {collection_url}")
+            else:
+                print("  无法从视频页面获取合集信息")
+                print("  提示: 该视频可能不属于任何合集，或需要登录才能查看")
+                return
+        else:
+            # 这是合集URL
+            print("\n[1/4] 下载合集页面...")
+            page_path, html_content = self.download_page(collection_url)
+            if not html_content:
+                print("无法下载页面")
+                return
+            
+            # 提取合集ID
+            print("\n[2/4] 提取合集信息...")
+            if collection_id:
+                print(f"合集ID: {collection_id}")
+            
+            # 从URL中提取mid（用户ID）
+            mid_match = re.search(r'/space\.bilibili\.com/(\d+)', collection_url)
+            mid = mid_match.group(1) if mid_match else None
+            if mid:
+                print(f"用户ID: {mid}")
         
         # 3. 获取视频URL列表
-        print("\n[3/4] 获取视频列表...")
+        is_single_video = bvid and not self.extract_collection_id(original_url)
+        if is_single_video:
+            print("\n[3/5] 获取视频列表...")
+        else:
+            print("\n[3/4] 获取视频列表...")
         video_urls = []
         video_info_list = []
         
@@ -359,8 +504,8 @@ class BilibiliCollectionDownloader:
                 video_info_list = api_info
                 print(f"  从API获取到 {len(video_urls)} 个视频")
         
-        # 方法2: 从HTML中提取
-        if not video_urls:
+        # 方法2: 从HTML中提取（仅当有HTML内容时）
+        if not video_urls and html_content:
             print("  从HTML中提取视频URL...")
             html_urls = self.extract_video_urls_from_html(html_content)
             if html_urls:
@@ -390,7 +535,10 @@ class BilibiliCollectionDownloader:
         os.makedirs(output_path, exist_ok=True)
         
         # 5. 下载视频
-        print(f"\n[4/4] 开始下载视频到: {output_path}")
+        if is_single_video:
+            print(f"\n[4/5] 开始下载视频到: {output_path}")
+        else:
+            print(f"\n[4/4] 开始下载视频到: {output_path}")
         print("=" * 60)
         
         success_count = 0
@@ -407,10 +555,10 @@ class BilibiliCollectionDownloader:
             print(f"  URL: {video_url}")
             
             if self.download_video_with_ytdlp(video_url, output_path, index=i):
-                print(f"  ✓ 下载成功")
+                print(f"  [成功] 下载成功")
                 success_count += 1
             else:
-                print(f"  ✗ 下载失败")
+                print(f"  [失败] 下载失败")
                 fail_count += 1
             
             # 避免请求过快
