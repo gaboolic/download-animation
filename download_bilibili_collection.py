@@ -375,6 +375,317 @@ class BilibiliCollectionDownloader:
         
         return video_urls, video_info_list
     
+    def check_video_downloaded(self, video_url, output_dir, video_title=None):
+        """检查视频是否已经下载（通过检查mp4文件是否存在）"""
+        try:
+            import subprocess
+            import json
+            
+            # 首先，快速检查目录中是否已有mp4文件
+            existing_files = []
+            if os.path.exists(output_dir):
+                existing_files = [f for f in os.listdir(output_dir) 
+                                if os.path.isfile(os.path.join(output_dir, f)) 
+                                and f.endswith(('.mp4', '.mkv', '.webm', '.flv'))]
+                
+                # 如果目录为空，直接返回False
+                if not existing_files:
+                    return False, None
+                
+                # 如果有视频标题，先尝试快速匹配（避免调用yt-dlp）
+                if video_title and len(video_title) > 5:
+                    title_key = video_title[:25].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
+                    for filename in existing_files:
+                        filename_key = filename[:50].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
+                        # 如果标题的关键部分在文件名中，认为已下载
+                        if title_key.lower() in filename_key.lower():
+                            return True, os.path.join(output_dir, filename)
+            
+            # 检查yt-dlp是否可用
+            try:
+                result = subprocess.run(['python', '-m', 'yt_dlp', '--version'], 
+                                      capture_output=True, 
+                                      timeout=5)
+                if result.returncode != 0:
+                    result = subprocess.run(['yt-dlp', '--version'], 
+                                          capture_output=True, 
+                                          timeout=5)
+                    if result.returncode != 0:
+                        # 如果yt-dlp不可用，但目录中有文件，使用简单的文件名匹配
+                        if video_title and os.path.exists(output_dir):
+                            title_key = video_title[:20].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                            for filename in existing_files:
+                                filename_key = filename[:40].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                                if title_key.lower() in filename_key.lower():
+                                    return True, os.path.join(output_dir, filename)
+                        return False, None
+                    use_python_module = False
+                else:
+                    use_python_module = True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                # 如果yt-dlp不可用，但目录中有文件，使用简单的文件名匹配
+                if video_title and os.path.exists(output_dir):
+                    title_key = video_title[:20].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                    for filename in existing_files:
+                        filename_key = filename[:40].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                        if title_key.lower() in filename_key.lower():
+                            return True, os.path.join(output_dir, filename)
+                return False, None
+            
+            # 获取视频信息（不下载）
+            if use_python_module:
+                cmd = [
+                    'python', '-m', 'yt_dlp',
+                    '--dump-json',
+                    '--no-warnings',
+                    '--quiet',
+                    video_url
+                ]
+            else:
+                cmd = [
+                    'yt-dlp',
+                    '--dump-json',
+                    '--no-warnings',
+                    '--quiet',
+                    video_url
+                ]
+            
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=30
+            )
+            
+            stdout, stderr = result.stdout, result.stderr
+            process_returncode = result.returncode
+            
+            if process_returncode == 0 and stdout:
+                try:
+                    video_info = json.loads(stdout)
+                    title = video_info.get('title', video_title or '')
+                    ext = video_info.get('ext', 'mp4')
+                    bvid = video_info.get('id', '')  # 获取视频ID
+                    
+                    # 从URL中提取bvid作为备用
+                    if not bvid:
+                        bvid_match = re.search(r'BV[a-zA-Z0-9]+', video_url)
+                        if bvid_match:
+                            bvid = bvid_match.group(0)
+                    
+                    # 生成预期的文件名（yt-dlp会清理文件名中的特殊字符）
+                    safe_title = title
+                    # 移除或替换文件名中不允许的字符
+                    invalid_chars = '<>:"/\\|?*'
+                    for char in invalid_chars:
+                        safe_title = safe_title.replace(char, '_')
+                    
+                    expected_filename = f"{safe_title}.{ext}"
+                    expected_path = os.path.join(output_dir, expected_filename)
+                    
+                    # 检查文件是否存在
+                    if os.path.exists(expected_path) and os.path.getsize(expected_path) > 0:
+                        return True, expected_path
+                    
+                    # 检查目录中是否有匹配的文件
+                    if os.path.exists(output_dir):
+                        for filename in os.listdir(output_dir):
+                            file_path = os.path.join(output_dir, filename)
+                            if os.path.isfile(file_path) and filename.endswith(('.mp4', '.m4a', '.webm', '.mkv', '.flv')):
+                                # 方法1: 通过视频ID匹配（最准确）
+                                if bvid and bvid in filename:
+                                    return True, file_path
+                                
+                                # 方法2: 通过标题匹配（更宽松的匹配）
+                                if title and len(title) > 5:
+                                    # 取标题的关键部分进行匹配（去除空格和特殊字符）
+                                    # 对于多分集视频，标题可能只匹配部分文件名
+                                    title_key = title[:25].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
+                                    filename_key = filename[:50].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
+                                    
+                                    # 检查标题的关键部分是否在文件名中
+                                    if title_key.lower() in filename_key.lower():
+                                        return True, file_path
+                                    
+                                    # 反向检查：文件名中的关键部分是否在标题中
+                                    if len(filename_key) > 10:
+                                        filename_key_short = filename_key[:15]
+                                        if filename_key_short.lower() in title_key.lower():
+                                            return True, file_path
+                except (json.JSONDecodeError, KeyError) as e:
+                    # 如果解析失败，尝试使用简单的文件名匹配
+                    if video_title and os.path.exists(output_dir):
+                        title_key = video_title[:20].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                        for filename in existing_files:
+                            filename_key = filename[:40].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                            if title_key.lower() in filename_key.lower():
+                                return True, os.path.join(output_dir, filename)
+                    pass
+            
+            return False, None
+        except Exception as e:
+            # 如果检查失败，尝试使用简单的文件名匹配
+            if video_title and os.path.exists(output_dir):
+                try:
+                    fallback_files = [f for f in os.listdir(output_dir) 
+                                    if os.path.isfile(os.path.join(output_dir, f)) 
+                                    and f.endswith(('.mp4', '.mkv', '.webm', '.flv'))]
+                    title_key = video_title[:20].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                    for filename in fallback_files:
+                        filename_key = filename[:40].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                        if title_key.lower() in filename_key.lower():
+                            return True, os.path.join(output_dir, filename)
+                except:
+                    pass
+            return False, None
+    
+    def merge_video_audio_files(self, output_dir):
+        """合并目录中分开的视频和音频文件"""
+        try:
+            import subprocess
+            
+            if not os.path.exists(output_dir):
+                return False
+            
+            # 查找所有mp4和m4a文件
+            mp4_files = {}
+            m4a_files = {}
+            
+            for filename in os.listdir(output_dir):
+                file_path = os.path.join(output_dir, filename)
+                if not os.path.isfile(file_path):
+                    continue
+                
+                # 提取基础文件名（去掉扩展名和可能的流标识符）
+                # 例如: "视频名.f100026.mp4" -> "视频名"
+                base_name = filename
+                # 移除扩展名
+                if filename.endswith('.mp4'):
+                    base_name = filename[:-4]
+                    # 移除可能的流标识符（如 .f100026）
+                    base_name = re.sub(r'\.f\d+$', '', base_name)
+                    mp4_files[base_name] = file_path
+                elif filename.endswith('.m4a'):
+                    base_name = filename[:-4]
+                    base_name = re.sub(r'\.f\d+$', '', base_name)
+                    m4a_files[base_name] = file_path
+            
+            # 找到匹配的视频和音频文件对
+            matched_pairs = []
+            for base_name in mp4_files:
+                if base_name in m4a_files:
+                    matched_pairs.append({
+                        'base_name': base_name,
+                        'video': mp4_files[base_name],
+                        'audio': m4a_files[base_name]
+                    })
+            
+            if not matched_pairs:
+                print("  未找到需要合并的视频和音频文件对")
+                return False
+            
+            print(f"  找到 {len(matched_pairs)} 个需要合并的文件对:")
+            for pair in matched_pairs:
+                print(f"    - {pair['base_name']}")
+            
+            # 检查ffmpeg是否可用
+            ffmpeg_available = False
+            try:
+                result = subprocess.run(['ffmpeg', '-version'], 
+                                      capture_output=True, 
+                                      timeout=5)
+                if result.returncode == 0:
+                    ffmpeg_available = True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+            
+            if not ffmpeg_available:
+                print("\n  错误: 未找到 ffmpeg，无法合并视频和音频文件")
+                print("  请安装 ffmpeg:")
+                print("    Windows: 下载 https://www.gyan.dev/ffmpeg/builds/ 或使用 chocolatey: choco install ffmpeg")
+                print("    或使用 winget: winget install ffmpeg")
+                print("    安装后请重启终端或重新运行脚本")
+                return False
+            
+            merged_count = 0
+            
+            # 合并每个文件对
+            for pair in matched_pairs:
+                base_name = pair['base_name']
+                video_path = pair['video']
+                audio_path = pair['audio']
+                
+                # 生成合并后的文件名
+                output_filename = f"{base_name}.mp4"
+                output_path = os.path.join(output_dir, output_filename)
+                
+                # 如果合并后的文件已存在，跳过
+                if os.path.exists(output_path):
+                    print(f"  跳过 {base_name} (已存在合并后的文件)")
+                    continue
+                
+                print(f"  正在合并: {base_name}")
+                
+                # 使用ffmpeg合并
+                cmd = [
+                    'ffmpeg',
+                    '-i', video_path,
+                    '-i', audio_path,
+                    '-c:v', 'copy',  # 视频流直接复制，不重新编码
+                    '-c:a', 'aac',   # 音频编码为aac
+                    '-y',            # 覆盖输出文件
+                    '-loglevel', 'error',  # 只显示错误信息
+                    output_path
+                ]
+                
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=300  # 5分钟超时
+                )
+                
+                if result.returncode == 0 and os.path.exists(output_path):
+                    # 检查输出文件大小，确保合并成功
+                    output_size = os.path.getsize(output_path)
+                    video_size = os.path.getsize(video_path)
+                    if output_size > video_size:  # 合并后的文件应该比单独的视频文件大
+                        # 合并成功，删除原始文件
+                        try:
+                            os.remove(video_path)
+                            os.remove(audio_path)
+                            print(f"    [成功] 已合并并删除原始文件")
+                            merged_count += 1
+                        except Exception as e:
+                            print(f"    [警告] 合并成功但删除原始文件失败: {e}")
+                    else:
+                        print(f"    [失败] 合并后的文件大小异常")
+                        try:
+                            os.remove(output_path)
+                        except:
+                            pass
+                else:
+                    error_msg = result.stderr.decode('utf-8', errors='ignore') if result.stderr else '未知错误'
+                    print(f"    [失败] 合并失败: {error_msg[:100]}")
+                    if os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except:
+                            pass
+            
+            if merged_count > 0:
+                print(f"\n  共成功合并了 {merged_count} 个视频文件")
+            else:
+                print(f"\n  没有成功合并任何文件")
+            
+            return merged_count > 0
+        except Exception as e:
+            print(f"  合并文件时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
     def download_video_with_ytdlp(self, video_url, output_dir, index=None):
         """使用yt-dlp下载视频（推荐方法）"""
         try:
@@ -404,10 +715,13 @@ class BilibiliCollectionDownloader:
             else:
                 output_template = os.path.join(output_dir, f"%(title)s.%(ext)s")
             
+            # 添加合并选项：自动合并视频和音频为mp4格式
+            # 如果视频和音频分开，yt-dlp会自动下载并合并
             if use_python_module:
                 cmd = [
                     'python', '-m', 'yt_dlp',
                     '-o', output_template,
+                    '--merge-output-format', 'mp4',  # 合并为mp4格式
                     '--no-warnings',
                     '--quiet',
                     video_url
@@ -416,6 +730,7 @@ class BilibiliCollectionDownloader:
                 cmd = [
                     'yt-dlp',
                     '-o', output_template,
+                    '--merge-output-format', 'mp4',  # 合并为mp4格式
                     '--no-warnings',
                     '--quiet',
                     video_url
@@ -469,14 +784,14 @@ class BilibiliCollectionDownloader:
                 return
         else:
             # 这是合集URL
-            print("\n[1/4] 下载合集页面...")
+            print("\n[1/5] 下载合集页面...")
             page_path, html_content = self.download_page(collection_url)
             if not html_content:
                 print("无法下载页面")
                 return
             
             # 提取合集ID
-            print("\n[2/4] 提取合集信息...")
+            print("\n[2/5] 提取合集信息...")
             if collection_id:
                 print(f"合集ID: {collection_id}")
             
@@ -488,10 +803,7 @@ class BilibiliCollectionDownloader:
         
         # 3. 获取视频URL列表
         is_single_video = bvid and not self.extract_collection_id(original_url)
-        if is_single_video:
-            print("\n[3/5] 获取视频列表...")
-        else:
-            print("\n[3/4] 获取视频列表...")
+        print("\n[3/5] 获取视频列表...")
         video_urls = []
         video_info_list = []
         
@@ -535,10 +847,7 @@ class BilibiliCollectionDownloader:
         os.makedirs(output_path, exist_ok=True)
         
         # 5. 下载视频
-        if is_single_video:
-            print(f"\n[4/5] 开始下载视频到: {output_path}")
-        else:
-            print(f"\n[4/4] 开始下载视频到: {output_path}")
+        print(f"\n[4/5] 开始下载视频到: {output_path}")
         print("=" * 60)
         
         success_count = 0
@@ -554,6 +863,13 @@ class BilibiliCollectionDownloader:
                 print(f"\n[{i}/{len(video_urls)}] 处理视频")
             print(f"  URL: {video_url}")
             
+            # 检查是否已经下载
+            is_downloaded, existing_file = self.check_video_downloaded(video_url, output_path, video_title=title)
+            if is_downloaded:
+                print(f"  [跳过] 文件已存在: {os.path.basename(existing_file)}")
+                success_count += 1
+                continue
+            
             if self.download_video_with_ytdlp(video_url, output_path, index=i):
                 print(f"  [成功] 下载成功")
                 success_count += 1
@@ -563,6 +879,10 @@ class BilibiliCollectionDownloader:
             
             # 避免请求过快
             time.sleep(2)
+        
+        # 6. 合并分开的视频和音频文件
+        print(f"\n[5/5] 检查并合并分开的视频和音频文件...")
+        self.merge_video_audio_files(output_path)
         
         print(f"\n{'='*60}")
         print(f"下载完成!")
