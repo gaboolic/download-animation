@@ -452,35 +452,43 @@ class BilibiliCollectionDownloader:
                 if not existing_files:
                     return False, None
                 
+                # 如果URL中有分P参数，优先匹配对应的分P文件
+                if page_num is not None:
+                    # 查找包含对应分P号的文件
+                    # 支持多种格式：p01, p1, p001, p 1, -1- 等
+                    # 注意：p=1 应该匹配 p01, p1, p001 等
+                    page_str = str(page_num)
+                    # 构建匹配模式：p后跟0或多个0，然后是分P号，后面跟非数字字符或字符串结尾
+                    page_pattern = re.compile(r'p0*' + page_str + r'(?:\D|$)', re.IGNORECASE)
+                    
+                    matched_files = []
+                    # 优先在包含BV号的文件中查找
+                    if bvid:
+                        bvid_files = [f for f in existing_files if bvid in f]
+                        search_files = bvid_files if bvid_files else existing_files
+                    else:
+                        search_files = existing_files
+                    
+                    for filename in search_files:
+                        # 排除中间文件
+                        if re.search(r'\.f\d+\.(mp4|m4a)$', filename) or filename.endswith('.m4a'):
+                            continue
+                        
+                        # 检查是否匹配分P号
+                        if page_pattern.search(filename):
+                            matched_files.append(filename)
+                    
+                    if matched_files:
+                        # 找到匹配的分P文件
+                        return True, os.path.join(output_dir, matched_files[0])
+                    else:
+                        # 没有找到对应的分P文件
+                        return False, None
+                
                 # 优先使用BV号精确匹配（最准确）
                 if bvid:
                     bvid_files = [f for f in existing_files if bvid in f]
                     if bvid_files:
-                        # 如果URL中有分P参数，必须匹配对应的分P文件
-                        if page_num is not None:
-                            # 查找包含对应分P号的文件
-                            # 支持多种格式：p01, p1, p001, p 1, -1- 等
-                            # 注意：p=1 应该匹配 p01, p1, p001 等
-                            page_str = str(page_num)
-                            # 构建匹配模式：p后跟0或多个0，然后是分P号，后面跟非数字字符或字符串结尾
-                            page_pattern = re.compile(r'p0*' + page_str + r'(?:\D|$)', re.IGNORECASE)
-                            
-                            matched_files = []
-                            for filename in bvid_files:
-                                # 排除中间文件
-                                if re.search(r'\.f\d+\.(mp4|m4a)$', filename) or filename.endswith('.m4a'):
-                                    continue
-                                
-                                # 检查是否匹配分P号
-                                if page_pattern.search(filename):
-                                    matched_files.append(filename)
-                            
-                            if matched_files:
-                                # 找到匹配的分P文件
-                                return True, os.path.join(output_dir, matched_files[0])
-                            else:
-                                # 没有找到对应的分P文件
-                                return False, None
                         # 对于多分集视频，需要检查所有分集是否都存在
                         # 先获取视频信息，看有多少个分集
                         try:
