@@ -274,8 +274,32 @@ class BilibiliCollectionDownloader:
         
         return None
     
+    def get_video_pages(self, bvid):
+        """获取视频的所有分P信息"""
+        try:
+            api_url = "https://api.bilibili.com/x/web-interface/view"
+            params = {'bvid': bvid}
+            response = self.session.get(api_url, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('code') == 0 and 'data' in data:
+                    video_data = data['data']
+                    pages = video_data.get('pages', [])
+                    if len(pages) > 1:
+                        # 有多个分P，返回所有分P信息
+                        return pages
+                    else:
+                        # 只有一个分P或没有分P信息
+                        return None
+        except Exception as e:
+            # 如果获取失败，返回None，使用原始URL
+            # 静默失败，不影响主流程
+            pass
+        return None
+    
     def extract_video_urls_from_api(self, collection_id, mid=None):
-        """从API获取视频列表"""
+        """从API获取视频列表，并展开多P视频的所有分集"""
         video_urls = []
         video_info_list = []  # 存储视频详细信息
         
@@ -327,15 +351,40 @@ class BilibiliCollectionDownloader:
                         title = archive.get('title', '未知标题')
                         
                         if bvid:
-                            url = f"https://www.bilibili.com/video/{bvid}"
-                            video_urls.append(url)
-                            video_info_list.append({
-                                'url': url,
-                                'title': title,
-                                'bvid': bvid,
-                                'aid': aid
-                            })
+                            # 检查是否有多个分P
+                            pages = self.get_video_pages(bvid)
+                            
+                            if pages and len(pages) > 1:
+                                # 有多个分P，展开每个分P
+                                print(f"    展开多P视频: {title} (共{len(pages)}集)")
+                                for page_info in pages:
+                                    page_num = page_info.get('page', 1)
+                                    page_title = page_info.get('part', title)
+                                    # 构建带分P参数的URL
+                                    url = f"https://www.bilibili.com/video/{bvid}?p={page_num}"
+                                    video_urls.append(url)
+                                    video_info_list.append({
+                                        'url': url,
+                                        'title': f"{title} - {page_title}",
+                                        'bvid': bvid,
+                                        'aid': aid,
+                                        'page': page_num
+                                    })
+                            else:
+                                # 单P视频或无法获取分P信息
+                                url = f"https://www.bilibili.com/video/{bvid}"
+                                video_urls.append(url)
+                                video_info_list.append({
+                                    'url': url,
+                                    'title': title,
+                                    'bvid': bvid,
+                                    'aid': aid
+                                })
+                            
+                            # 添加小延迟，避免请求过快
+                            time.sleep(0.1)
                         elif aid:
+                            # 对于av号，暂时不展开分P（av号已废弃，新视频都用BV号）
                             url = f"https://www.bilibili.com/video/av{aid}"
                             video_urls.append(url)
                             video_info_list.append({
@@ -350,7 +399,7 @@ class BilibiliCollectionDownloader:
                     if total == 0:
                         total = data.get('total', 0)
                     
-                    print(f"  当前总数: {len(video_urls)}, API返回总数: {total}")
+                    print(f"  当前总数: {len(video_urls)} 个视频/分集, API返回总数: {total}")
                     
                     # 如果当前页返回的视频数少于page_size，说明已经是最后一页
                     # 或者已经获取的数量达到或超过总数
@@ -359,6 +408,8 @@ class BilibiliCollectionDownloader:
                         break
                     
                     if total > 0 and len(video_urls) >= total:
+                        # 注意：这里total是视频数，不是分集数，所以可能不准确
+                        # 但至少可以作为一个参考
                         print(f"  已获取所有视频（{len(video_urls)} >= {total}）")
                         break
                     
