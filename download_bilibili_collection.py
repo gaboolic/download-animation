@@ -381,6 +381,9 @@ class BilibiliCollectionDownloader:
             import subprocess
             import json
             
+            # 从URL中提取BV号（最准确的标识）
+            bvid = self.extract_bvid_from_url(video_url)
+            
             # 首先，快速检查目录中是否已有mp4文件
             existing_files = []
             if os.path.exists(output_dir):
@@ -392,14 +395,178 @@ class BilibiliCollectionDownloader:
                 if not existing_files:
                     return False, None
                 
-                # 如果有视频标题，先尝试快速匹配（避免调用yt-dlp）
+                # 优先使用BV号精确匹配（最准确）
+                if bvid:
+                    bvid_files = [f for f in existing_files if bvid in f]
+                    if bvid_files:
+                        # 对于多分集视频，需要检查所有分集是否都存在
+                        # 先获取视频信息，看有多少个分集
+                        try:
+                            result = subprocess.run(['python', '-m', 'yt_dlp', '--version'], 
+                                                  capture_output=True, timeout=5)
+                            if result.returncode != 0:
+                                result = subprocess.run(['yt-dlp', '--version'], 
+                                                      capture_output=True, timeout=5)
+                                if result.returncode != 0:
+                                    # yt-dlp不可用，使用简单匹配
+                                    return True, os.path.join(output_dir, bvid_files[0])
+                                use_python_module = False
+                            else:
+                                use_python_module = True
+                            
+                            # 获取视频信息，检查分集数量
+                            if use_python_module:
+                                cmd = ['python', '-m', 'yt_dlp', '--dump-json', '--no-warnings', '--quiet', video_url]
+                            else:
+                                cmd = ['yt-dlp', '--dump-json', '--no-warnings', '--quiet', video_url]
+                            
+                            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                                  universal_newlines=True, timeout=30)
+                            
+                            if result.returncode == 0 and result.stdout:
+                                try:
+                                    video_info = json.loads(result.stdout)
+                                    # 检查是否有多个分集（entries）
+                                    entries = video_info.get('entries', [])
+                                    if entries:
+                                        # 多分集视频，需要检查所有分集
+                                        expected_count = len(entries)
+                                        # 统计目录中该BV号对应的文件数（排除中间文件如.f100026.mp4等）
+                                        bvid_complete_files = [f for f in bvid_files 
+                                                              if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                                              and not f.endswith('.m4a')]
+                                        if len(bvid_complete_files) >= expected_count:
+                                            return True, os.path.join(output_dir, bvid_complete_files[0])
+                                        else:
+                                            # 分集不完整，需要重新下载
+                                            print(f"    检测到分集不完整: 期望 {expected_count} 个，实际 {len(bvid_complete_files)} 个")
+                                            return False, None
+                                except (json.JSONDecodeError, KeyError):
+                                    # JSON解析失败，继续检查文件名模式
+                                    pass
+                                
+                                # 即使yt-dlp没有返回entries或解析失败，也要检查文件名模式
+                                episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                                episode_numbers = set()
+                                bvid_complete_files = [f for f in bvid_files 
+                                                      if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                                      and not f.endswith('.m4a')]
+                                
+                                for filename in bvid_complete_files:
+                                    match = episode_pattern.search(filename)
+                                    if match:
+                                        episode_numbers.add(int(match.group(1)))
+                                
+                                if episode_numbers:
+                                    # 有分集标识，检查是否连续（从1开始）
+                                    max_episode = max(episode_numbers)
+                                    expected_episodes = set(range(1, max_episode + 1))
+                                    if episode_numbers == expected_episodes:
+                                        # 分集完整
+                                        return True, os.path.join(output_dir, bvid_complete_files[0])
+                                    else:
+                                        # 分集不完整，需要重新下载
+                                        missing = expected_episodes - episode_numbers
+                                        print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                        return False, None
+                                else:
+                                    # 没有分集标识，可能是单集视频，有文件就认为已下载
+                                    return True, os.path.join(output_dir, bvid_files[0])
+                            else:
+                                # yt-dlp返回错误或没有输出，尝试通过文件名模式检查
+                                episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                                episode_numbers = set()
+                                bvid_complete_files = [f for f in bvid_files 
+                                                      if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                                      and not f.endswith('.m4a')]
+                                
+                                for filename in bvid_complete_files:
+                                    match = episode_pattern.search(filename)
+                                    if match:
+                                        episode_numbers.add(int(match.group(1)))
+                                
+                                if episode_numbers:
+                                    max_episode = max(episode_numbers)
+                                    expected_episodes = set(range(1, max_episode + 1))
+                                    if episode_numbers == expected_episodes:
+                                        return True, os.path.join(output_dir, bvid_complete_files[0])
+                                    else:
+                                        missing = expected_episodes - episode_numbers
+                                        print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                        return False, None
+                                else:
+                                    # 没有分集标识，可能是单集视频，有文件就认为已下载
+                                    return True, os.path.join(output_dir, bvid_files[0])
+                        except Exception as e:
+                            # 如果获取信息失败，尝试通过文件名模式推断分集数量
+                            # 检查文件名中是否有分集标识（如 p01, p02等）
+                            episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                            episode_numbers = set()
+                            # 排除中间文件，只检查完整的视频文件
+                            bvid_complete_files = [f for f in bvid_files 
+                                                  if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                                  and not f.endswith('.m4a')]
+                            
+                            for filename in bvid_complete_files:
+                                match = episode_pattern.search(filename)
+                                if match:
+                                    episode_numbers.add(int(match.group(1)))
+                            
+                            if episode_numbers:
+                                # 有分集标识，检查是否连续（从1开始）
+                                max_episode = max(episode_numbers)
+                                expected_episodes = set(range(1, max_episode + 1))
+                                if episode_numbers == expected_episodes:
+                                    # 分集完整
+                                    return True, os.path.join(output_dir, bvid_complete_files[0])
+                                else:
+                                    # 分集不完整，需要重新下载
+                                    missing = expected_episodes - episode_numbers
+                                    print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                    return False, None
+                            else:
+                                # 没有分集标识，可能是单集视频，有文件就认为已下载
+                                return True, os.path.join(output_dir, bvid_files[0])
+                
+                # 如果没有BV号或BV号匹配失败，使用标题匹配（备用方法）
+                # 但即使通过标题匹配找到文件，也要检查分集是否完整
                 if video_title and len(video_title) > 5:
                     title_key = video_title[:25].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
+                    matched_files = []
                     for filename in existing_files:
                         filename_key = filename[:50].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
-                        # 如果标题的关键部分在文件名中，认为已下载
+                        # 如果标题的关键部分在文件名中，收集匹配的文件
                         if title_key.lower() in filename_key.lower():
-                            return True, os.path.join(output_dir, filename)
+                            matched_files.append(filename)
+                    
+                    if matched_files:
+                        # 检查这些匹配的文件是否有分集标识
+                        episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                        episode_numbers = set()
+                        complete_files = [f for f in matched_files 
+                                        if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                        and not f.endswith('.m4a')]
+                        
+                        for filename in complete_files:
+                            match = episode_pattern.search(filename)
+                            if match:
+                                episode_numbers.add(int(match.group(1)))
+                        
+                        if episode_numbers:
+                            # 有分集标识，检查是否连续（从1开始）
+                            max_episode = max(episode_numbers)
+                            expected_episodes = set(range(1, max_episode + 1))
+                            if episode_numbers == expected_episodes:
+                                # 分集完整
+                                return True, os.path.join(output_dir, complete_files[0])
+                            else:
+                                # 分集不完整，需要重新下载
+                                missing = expected_episodes - episode_numbers
+                                print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                return False, None
+                        else:
+                            # 没有分集标识，可能是单集视频，有文件就认为已下载
+                            return True, os.path.join(output_dir, matched_files[0])
             
             # 检查yt-dlp是否可用
             try:
@@ -412,24 +579,78 @@ class BilibiliCollectionDownloader:
                                           timeout=5)
                     if result.returncode != 0:
                         # 如果yt-dlp不可用，但目录中有文件，使用简单的文件名匹配
+                        # 但即使通过标题匹配找到文件，也要检查分集是否完整
                         if video_title and os.path.exists(output_dir):
                             title_key = video_title[:20].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                            matched_files = []
                             for filename in existing_files:
                                 filename_key = filename[:40].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
                                 if title_key.lower() in filename_key.lower():
-                                    return True, os.path.join(output_dir, filename)
+                                    matched_files.append(filename)
+                            
+                            if matched_files:
+                                # 检查分集是否完整
+                                episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                                episode_numbers = set()
+                                complete_files = [f for f in matched_files 
+                                                if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                                and not f.endswith('.m4a')]
+                                
+                                for filename in complete_files:
+                                    match = episode_pattern.search(filename)
+                                    if match:
+                                        episode_numbers.add(int(match.group(1)))
+                                
+                                if episode_numbers:
+                                    max_episode = max(episode_numbers)
+                                    expected_episodes = set(range(1, max_episode + 1))
+                                    if episode_numbers == expected_episodes:
+                                        return True, os.path.join(output_dir, complete_files[0])
+                                    else:
+                                        missing = expected_episodes - episode_numbers
+                                        print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                        return False, None
+                                else:
+                                    return True, os.path.join(output_dir, matched_files[0])
                         return False, None
                     use_python_module = False
                 else:
                     use_python_module = True
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 # 如果yt-dlp不可用，但目录中有文件，使用简单的文件名匹配
+                # 但即使通过标题匹配找到文件，也要检查分集是否完整
                 if video_title and os.path.exists(output_dir):
                     title_key = video_title[:20].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                    matched_files = []
                     for filename in existing_files:
                         filename_key = filename[:40].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
                         if title_key.lower() in filename_key.lower():
-                            return True, os.path.join(output_dir, filename)
+                            matched_files.append(filename)
+                    
+                    if matched_files:
+                        # 检查分集是否完整
+                        episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                        episode_numbers = set()
+                        complete_files = [f for f in matched_files 
+                                        if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                        and not f.endswith('.m4a')]
+                        
+                        for filename in complete_files:
+                            match = episode_pattern.search(filename)
+                            if match:
+                                episode_numbers.add(int(match.group(1)))
+                        
+                        if episode_numbers:
+                            max_episode = max(episode_numbers)
+                            expected_episodes = set(range(1, max_episode + 1))
+                            if episode_numbers == expected_episodes:
+                                return True, os.path.join(output_dir, complete_files[0])
+                            else:
+                                missing = expected_episodes - episode_numbers
+                                print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                return False, None
+                        else:
+                            return True, os.path.join(output_dir, matched_files[0])
                 return False, None
             
             # 获取视频信息（不下载）
@@ -466,61 +687,125 @@ class BilibiliCollectionDownloader:
                     video_info = json.loads(stdout)
                     title = video_info.get('title', video_title or '')
                     ext = video_info.get('ext', 'mp4')
-                    bvid = video_info.get('id', '')  # 获取视频ID
+                    video_bvid = video_info.get('id', '')  # 获取视频ID
                     
                     # 从URL中提取bvid作为备用
-                    if not bvid:
+                    if not video_bvid:
                         bvid_match = re.search(r'BV[a-zA-Z0-9]+', video_url)
                         if bvid_match:
-                            bvid = bvid_match.group(0)
+                            video_bvid = bvid_match.group(0)
                     
-                    # 生成预期的文件名（yt-dlp会清理文件名中的特殊字符）
-                    safe_title = title
-                    # 移除或替换文件名中不允许的字符
-                    invalid_chars = '<>:"/\\|?*'
-                    for char in invalid_chars:
-                        safe_title = safe_title.replace(char, '_')
-                    
-                    expected_filename = f"{safe_title}.{ext}"
-                    expected_path = os.path.join(output_dir, expected_filename)
-                    
-                    # 检查文件是否存在
-                    if os.path.exists(expected_path) and os.path.getsize(expected_path) > 0:
-                        return True, expected_path
-                    
-                    # 检查目录中是否有匹配的文件
-                    if os.path.exists(output_dir):
-                        for filename in os.listdir(output_dir):
-                            file_path = os.path.join(output_dir, filename)
-                            if os.path.isfile(file_path) and filename.endswith(('.mp4', '.m4a', '.webm', '.mkv', '.flv')):
-                                # 方法1: 通过视频ID匹配（最准确）
-                                if bvid and bvid in filename:
-                                    return True, file_path
-                                
-                                # 方法2: 通过标题匹配（更宽松的匹配）
-                                if title and len(title) > 5:
-                                    # 取标题的关键部分进行匹配（去除空格和特殊字符）
-                                    # 对于多分集视频，标题可能只匹配部分文件名
-                                    title_key = title[:25].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
-                                    filename_key = filename[:50].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
-                                    
-                                    # 检查标题的关键部分是否在文件名中
-                                    if title_key.lower() in filename_key.lower():
+                    # 检查是否有多个分集（entries）
+                    entries = video_info.get('entries', [])
+                    if entries:
+                        # 多分集视频，需要检查所有分集是否都存在
+                        expected_count = len(entries)
+                        if os.path.exists(output_dir):
+                            # 统计目录中该BV号对应的完整文件数（排除中间文件）
+                            bvid_files = [f for f in os.listdir(output_dir) 
+                                        if os.path.isfile(os.path.join(output_dir, f))
+                                        and video_bvid in f
+                                        and f.endswith(('.mp4', '.mkv', '.webm', '.flv'))
+                                        and not re.search(r'\.f\d+\.(mp4|m4a)$', f)
+                                        and not f.endswith('.m4a')]
+                            
+                            if len(bvid_files) >= expected_count:
+                                return True, os.path.join(output_dir, bvid_files[0])
+                            else:
+                                # 分集不完整，需要重新下载
+                                return False, None
+                    else:
+                        # 单集视频，使用BV号精确匹配
+                        if video_bvid and os.path.exists(output_dir):
+                            for filename in os.listdir(output_dir):
+                                file_path = os.path.join(output_dir, filename)
+                                if os.path.isfile(file_path) and filename.endswith(('.mp4', '.m4a', '.webm', '.mkv', '.flv')):
+                                    # 通过视频ID匹配（最准确）
+                                    if video_bvid in filename and not re.search(r'\.f\d+\.(mp4|m4a)$', filename):
                                         return True, file_path
-                                    
-                                    # 反向检查：文件名中的关键部分是否在标题中
-                                    if len(filename_key) > 10:
-                                        filename_key_short = filename_key[:15]
-                                        if filename_key_short.lower() in title_key.lower():
-                                            return True, file_path
+                        
+                        # 如果BV号匹配失败，尝试标题匹配
+                        safe_title = title
+                        invalid_chars = '<>:"/\\|?*'
+                        for char in invalid_chars:
+                            safe_title = safe_title.replace(char, '_')
+                        
+                        expected_filename = f"{safe_title}.{ext}"
+                        expected_path = os.path.join(output_dir, expected_filename)
+                        
+                        # 检查文件是否存在
+                        if os.path.exists(expected_path) and os.path.getsize(expected_path) > 0:
+                            return True, expected_path
+                        
+                        # 通过标题匹配（备用方法），但也要检查分集是否完整
+                        if title and len(title) > 5 and os.path.exists(output_dir):
+                            title_key = title[:25].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
+                            matched_files = []
+                            for filename in os.listdir(output_dir):
+                                file_path = os.path.join(output_dir, filename)
+                                if os.path.isfile(file_path) and filename.endswith(('.mp4', '.m4a', '.webm', '.mkv', '.flv')):
+                                    filename_key = filename[:50].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '').replace(' ', '')
+                                    if title_key.lower() in filename_key.lower():
+                                        matched_files.append(filename)
+                            
+                            if matched_files:
+                                # 检查分集是否完整
+                                episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                                episode_numbers = set()
+                                complete_files = [f for f in matched_files 
+                                                if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                                and not f.endswith('.m4a')]
+                                
+                                for filename in complete_files:
+                                    match = episode_pattern.search(filename)
+                                    if match:
+                                        episode_numbers.add(int(match.group(1)))
+                                
+                                if episode_numbers:
+                                    max_episode = max(episode_numbers)
+                                    expected_episodes = set(range(1, max_episode + 1))
+                                    if episode_numbers == expected_episodes:
+                                        return True, os.path.join(output_dir, complete_files[0])
+                                    else:
+                                        missing = expected_episodes - episode_numbers
+                                        print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                        return False, None
+                                else:
+                                    return True, os.path.join(output_dir, matched_files[0])
                 except (json.JSONDecodeError, KeyError) as e:
-                    # 如果解析失败，尝试使用简单的文件名匹配
+                    # 如果解析失败，尝试使用简单的文件名匹配，但也要检查分集是否完整
                     if video_title and os.path.exists(output_dir):
                         title_key = video_title[:20].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
+                        matched_files = []
                         for filename in existing_files:
                             filename_key = filename[:40].replace(' ', '').replace('_', '').replace('-', '').replace('【', '').replace('】', '')
                             if title_key.lower() in filename_key.lower():
-                                return True, os.path.join(output_dir, filename)
+                                matched_files.append(filename)
+                        
+                        if matched_files:
+                            # 检查分集是否完整
+                            episode_pattern = re.compile(r'p(\d+)', re.IGNORECASE)
+                            episode_numbers = set()
+                            complete_files = [f for f in matched_files 
+                                            if not re.search(r'\.f\d+\.(mp4|m4a)$', f) 
+                                            and not f.endswith('.m4a')]
+                            
+                            for filename in complete_files:
+                                match = episode_pattern.search(filename)
+                                if match:
+                                    episode_numbers.add(int(match.group(1)))
+                            
+                            if episode_numbers:
+                                max_episode = max(episode_numbers)
+                                expected_episodes = set(range(1, max_episode + 1))
+                                if episode_numbers == expected_episodes:
+                                    return True, os.path.join(output_dir, complete_files[0])
+                                else:
+                                    missing = expected_episodes - episode_numbers
+                                    print(f"    检测到分集不完整，缺少: {sorted(missing)}")
+                                    return False, None
+                            else:
+                                return True, os.path.join(output_dir, matched_files[0])
                     pass
             
             return False, None
@@ -625,7 +910,25 @@ class BilibiliCollectionDownloader:
                     print(f"  跳过 {base_name} (已存在合并后的文件)")
                     continue
                 
-                print(f"  正在合并: {base_name}")
+                # 获取文件大小信息
+                try:
+                    video_size = os.path.getsize(video_path)
+                    audio_size = os.path.getsize(audio_path)
+                    total_size_mb = (video_size + audio_size) / (1024 * 1024)
+                    print(f"  正在合并: {base_name}")
+                    print(f"    视频文件: {video_size / (1024*1024):.2f} MB, 音频文件: {audio_size / (1024*1024):.2f} MB")
+                except Exception as e:
+                    print(f"  正在合并: {base_name}")
+                    total_size_mb = 0
+                
+                # 根据文件大小动态计算超时时间
+                # 每MB给2秒，最少300秒，最多3600秒（1小时）
+                if total_size_mb > 0:
+                    timeout_seconds = max(300, min(3600, int(total_size_mb * 2)))
+                else:
+                    timeout_seconds = 1800  # 默认30分钟
+                
+                print(f"    预计耗时: 最多 {timeout_seconds // 60} 分钟")
                 
                 # 使用ffmpeg合并
                 cmd = [
@@ -639,35 +942,49 @@ class BilibiliCollectionDownloader:
                     output_path
                 ]
                 
-                result = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=300  # 5分钟超时
-                )
-                
-                if result.returncode == 0 and os.path.exists(output_path):
-                    # 检查输出文件大小，确保合并成功
-                    output_size = os.path.getsize(output_path)
-                    video_size = os.path.getsize(video_path)
-                    if output_size > video_size:  # 合并后的文件应该比单独的视频文件大
-                        # 合并成功，删除原始文件
-                        try:
-                            os.remove(video_path)
-                            os.remove(audio_path)
-                            print(f"    [成功] 已合并并删除原始文件")
-                            merged_count += 1
-                        except Exception as e:
-                            print(f"    [警告] 合并成功但删除原始文件失败: {e}")
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout_seconds
+                    )
+                    
+                    if result.returncode == 0 and os.path.exists(output_path):
+                        # 检查输出文件大小，确保合并成功
+                        output_size = os.path.getsize(output_path)
+                        video_size = os.path.getsize(video_path)
+                        if output_size > video_size:  # 合并后的文件应该比单独的视频文件大
+                            # 合并成功，删除原始文件
+                            try:
+                                os.remove(video_path)
+                                os.remove(audio_path)
+                                print(f"    [成功] 已合并并删除原始文件")
+                                merged_count += 1
+                            except Exception as e:
+                                print(f"    [警告] 合并成功但删除原始文件失败: {e}")
+                        else:
+                            print(f"    [失败] 合并后的文件大小异常")
+                            try:
+                                os.remove(output_path)
+                            except:
+                                pass
                     else:
-                        print(f"    [失败] 合并后的文件大小异常")
-                        try:
-                            os.remove(output_path)
-                        except:
-                            pass
-                else:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore') if result.stderr else '未知错误'
-                    print(f"    [失败] 合并失败: {error_msg[:100]}")
+                        error_msg = result.stderr.decode('utf-8', errors='ignore') if result.stderr else '未知错误'
+                        print(f"    [失败] 合并失败: {error_msg[:100]}")
+                        if os.path.exists(output_path):
+                            try:
+                                os.remove(output_path)
+                            except:
+                                pass
+                except subprocess.TimeoutExpired:
+                    print(f"    [超时] 合并操作超时（{timeout_seconds // 60} 分钟）")
+                    print(f"    提示: 文件较大，合并需要更长时间。您可以:")
+                    print(f"      1. 手动运行以下命令合并:")
+                    print(f"         ffmpeg -i \"{video_path}\" -i \"{audio_path}\" -c:v copy -c:a aac -y \"{output_path}\"")
+                    print(f"      2. 或者重新运行脚本，脚本会跳过已存在的文件并继续处理其他文件")
+                except Exception as e:
+                    print(f"    [错误] 合并过程出错: {e}")
                     if os.path.exists(output_path):
                         try:
                             os.remove(output_path)
