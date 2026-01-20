@@ -1148,8 +1148,82 @@ class BilibiliCollectionDownloader:
                 print(f"  合集URL: {collection_url}")
             else:
                 print("  无法从视频页面获取合集信息")
-                print("  提示: 该视频可能不属于任何合集，或需要登录才能查看")
-                return
+                # 检查是否是多P视频
+                print("  检查是否是多P视频...")
+                pages = self.get_video_pages(bvid)
+                if pages and len(pages) > 1:
+                    print(f"  检测到多P视频，共 {len(pages)} 个分集")
+                    # 生成所有分P的URL
+                    video_urls = []
+                    video_info_list = []
+                    for page_info in pages:
+                        page_num = page_info.get('page', 1)
+                        page_title = page_info.get('part', f'分P{page_num}')
+                        url = f"https://www.bilibili.com/video/{bvid}?p={page_num}"
+                        video_urls.append(url)
+                        video_info_list.append({
+                            'url': url,
+                            'title': page_title,
+                            'bvid': bvid,
+                            'page': page_num
+                        })
+                    
+                    # 显示视频列表
+                    print(f"\n找到 {len(video_urls)} 个分集:")
+                    for i, info in enumerate(video_info_list, 1):
+                        print(f"  {i}. {info['title']}")
+                        print(f"     {info['url']}")
+                    
+                    # 创建输出目录
+                    safe_dir_name = f"bilibili_video_{bvid}"
+                    output_path = os.path.join(output_dir, safe_dir_name)
+                    os.makedirs(output_path, exist_ok=True)
+                    
+                    # 下载视频
+                    print(f"\n[4/5] 开始下载视频到: {output_path}")
+                    print("=" * 60)
+                    
+                    success_count = 0
+                    fail_count = 0
+                    
+                    for i, video_url in enumerate(video_urls, 1):
+                        video_info = video_info_list[i-1]
+                        title = video_info.get('title', '')
+                        
+                        print(f"\n[{i}/{len(video_urls)}] {title}")
+                        print(f"  URL: {video_url}")
+                        
+                        # 检查是否已经下载
+                        is_downloaded, existing_file = self.check_video_downloaded(video_url, output_path, video_title=title)
+                        if is_downloaded:
+                            print(f"  [跳过] 文件已存在: {os.path.basename(existing_file)}")
+                            success_count += 1
+                            continue
+                        
+                        if self.download_video_with_ytdlp(video_url, output_path, index=i):
+                            print(f"  [成功] 下载成功")
+                            success_count += 1
+                        else:
+                            print(f"  [失败] 下载失败")
+                            fail_count += 1
+                        
+                        # 避免请求过快
+                        time.sleep(2)
+                    
+                    # 合并分开的视频和音频文件
+                    print(f"\n[5/5] 检查并合并分开的视频和音频文件...")
+                    self.merge_video_audio_files(output_path)
+                    
+                    print(f"\n{'='*60}")
+                    print(f"下载完成!")
+                    print(f"成功: {success_count}, 失败: {fail_count}")
+                    print(f"输出目录: {output_path}")
+                    print(f"{'='*60}")
+                    return
+                else:
+                    print("  提示: 该视频可能不属于任何合集，或需要登录才能查看")
+                    print("  如果是单P视频，可以直接使用 yt-dlp 下载")
+                    return
         else:
             # 这是合集URL
             print("\n[1/5] 下载合集页面...")
